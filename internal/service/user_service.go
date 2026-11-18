@@ -7,19 +7,24 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/mail"
+	"strings"
 )
 
 var (
 	ErrUserAlreadyExists  = errors.New("user already exists")
 	ErrInvalidCredentials = errors.New("invalid credentials")
 	ErrUserNotFound       = errors.New("user not found")
+	ErrValidation         = errors.New("validation error")
 )
 
+// UserService реализует бизнес-логику управления пользователями и аутентификации
 type UserService struct {
 	userRepo   repository.UserRepository
 	jwtManager *auth.JWTManager
 }
 
+// NewUserService создает новый экземпляр сервиса пользователей
 func NewUserService(userRepo repository.UserRepository, jwtManager *auth.JWTManager) *UserService {
 	return &UserService{
 		userRepo:   userRepo,
@@ -27,56 +32,161 @@ func NewUserService(userRepo repository.UserRepository, jwtManager *auth.JWTMana
 	}
 }
 
+// Register валидирует данные, регистрирует нового пользователя и возвращает JWT токен
 func (s *UserService) Register(ctx context.Context, req *model.UserCreateRequest) (*model.TokenResponse, error) {
-	// TODO: Реализовать регистрацию пользователя
-	// Шаги:
-	// 1. Валидация входных данных (username >= 3 символов, email валидный, пароль >= 6 символов)
-	// 2. Проверить уникальность email через репозиторий
-	// 3. Проверить уникальность username через репозиторий
-	// 4. Захешировать пароль используя пакет auth
-	// 5. Создать модель пользователя с хешированным паролем
-	// 6. Сохранить пользователя через репозиторий
-	// 7. Сгенерировать JWT токен для нового пользователя
-	// 8. Вернуть TokenResponse с токеном и данными пользователя
+	if err := validateUserCreateRequest(req); err != nil {
+		return nil, err
+	}
 
-	return nil, fmt.Errorf("not implemented")
+	// Нормализуем email и username
+	email := strings.TrimSpace(strings.ToLower(req.Email))
+	username := strings.TrimSpace(req.Username)
+
+	// Проверяем уникальность email
+	emailExists, err := s.userRepo.ExistsByEmail(ctx, email)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check email uniqueness: %w", err)
+	}
+	if emailExists {
+		return nil, ErrUserAlreadyExists
+	}
+
+	// Проверяем уникальность username
+	usernameExists, err := s.userRepo.ExistsByUsername(ctx, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check username uniqueness: %w", err)
+	}
+	if usernameExists {
+		return nil, ErrUserAlreadyExists
+	}
+
+	// Хешируем пароль с помощью bcrypt
+	hashedPassword, err := auth.HashPassword(req.Password)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrValidation, err)
+	}
+
+	user := &model.User{
+		Username: username,
+		Email:    email,
+		Password: hashedPassword,
+	}
+
+	// Сохраняем пользователя в базе данных
+	if err := s.userRepo.Create(ctx, user); err != nil {
+		if errors.Is(err, repository.ErrUserExists) {
+			return nil, ErrUserAlreadyExists
+		}
+		return nil, fmt.Errorf("failed to create user: %w", err)
+	}
+
+	// Генерируем JWT токен для созданного пользователя
+	token, expiresAt, err := s.jwtManager.GenerateToken(user.ID, user.Email, user.Username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate token: %w", err)
+	}
+
+	return &model.TokenResponse{
+		Token:     token,
+		ExpiresAt: expiresAt,
+		User:      user.ToResponse(),
+	}, nil
 }
 
+// Login проверяет учетные данные пользователя и выдает JWT токен
 func (s *UserService) Login(ctx context.Context, req *model.UserLoginRequest) (*model.TokenResponse, error) {
-	// TODO: Реализовать вход пользователя
-	// Шаги:
-	// 1. Валидация входных данных
-	// 2. Найти пользователя по email через репозиторий
-	// 3. Проверить пароль используя функцию из пакета auth
-	// 4. Сгенерировать JWT токен при успешной аутентификации
-	// 5. Вернуть TokenResponse
-	// ВАЖНО: При ошибке не раскрывать, что именно неправильно (email или пароль)
+	if err := validateUserLoginRequest(req); err != nil {
+		return nil, err
+	}
 
-	return nil, fmt.Errorf("not implemented")
+	email := strings.TrimSpace(strings.ToLower(req.Email))
+
+	// Ищем пользователя по email (при отсутствии возвращаем общую ошибку ErrInvalidCredentials)
+	user, err := s.userRepo.GetByEmail(ctx, email)
+	if err != nil {
+		if errors.Is(err, repository.ErrUserNotFound) {
+			return nil, ErrInvalidCredentials
+		}
+		return nil, fmt.Errorf("failed to get user: %w", err)
+	}
+
+	// Сверяем введенный пароль с хешем в базе
+	if !auth.CheckPassword(req.Password, user.Password) {
+		return nil, ErrInvalidCredentials
+	}
+
+	// Генерируем JWT токен
+	token, expiresAt, err := s.jwtManager.GenerateToken(user.ID, user.Email, user.Username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate token: %w", err)
+	}
+
+	return &model.TokenResponse{
+		Token:     token,
+		ExpiresAt: expiresAt,
+		User:      user.ToResponse(),
+	}, nil
 }
 
+// ValidateToken проверяет валидность JWT токена и возвращает claims пользователя
+func (s *UserService) ValidateToken(tokenString string) (*auth.Claims, error) {
+	return s.jwtManager.ValidateToken(tokenString)
+}
+
+// GetByID возвращает пользователя по его идентификатору
 func (s *UserService) GetByID(ctx context.Context, id int) (*model.User, error) {
-	// TODO: Получить пользователя по ID через репозиторий
-
-	return nil, fmt.Errorf("not implemented")
+	user, err := s.userRepo.GetByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, repository.ErrUserNotFound) {
+			return nil, ErrUserNotFound
+		}
+		return nil, err
+	}
+	return user, nil
 }
 
+// GetByEmail возвращает пользователя по адресу электронной почты
 func (s *UserService) GetByEmail(ctx context.Context, email string) (*model.User, error) {
-	// TODO: Получить пользователя по email через репозиторий
-
-	return nil, fmt.Errorf("not implemented")
+	user, err := s.userRepo.GetByEmail(ctx, email)
+	if err != nil {
+		if errors.Is(err, repository.ErrUserNotFound) {
+			return nil, ErrUserNotFound
+		}
+		return nil, err
+	}
+	return user, nil
 }
 
-// validateUserCreateRequest проверяет корректность данных для регистрации
+// validateUserCreateRequest проверяет корректность полей при регистрации
 func validateUserCreateRequest(req *model.UserCreateRequest) error {
-	// TODO: Реализовать проверку всех полей
-
+	if req == nil {
+		return fmt.Errorf("%w: request body is empty", ErrValidation)
+	}
+	usernameLen := len([]rune(strings.TrimSpace(req.Username)))
+	if usernameLen < 3 || usernameLen > 50 {
+		return fmt.Errorf("%w: username must be between 3 and 50 characters", ErrValidation)
+	}
+	email := strings.TrimSpace(req.Email)
+	if _, err := mail.ParseAddress(email); err != nil {
+		return fmt.Errorf("%w: invalid email address", ErrValidation)
+	}
+	if err := auth.ValidatePasswordStrength(req.Password); err != nil {
+		return fmt.Errorf("%w: %v", ErrValidation, err)
+	}
 	return nil
 }
 
-// validateUserLoginRequest проверяет корректность данных для входа
+// validateUserLoginRequest проверяет корректность полей при входе
 func validateUserLoginRequest(req *model.UserLoginRequest) error {
-	// TODO: Реализовать проверку полей
-
+	if req == nil {
+		return fmt.Errorf("%w: request body is empty", ErrValidation)
+	}
+	email := strings.TrimSpace(req.Email)
+	if email == "" || req.Password == "" {
+		return fmt.Errorf("%w: email and password are required", ErrValidation)
+	}
+	if _, err := mail.ParseAddress(email); err != nil {
+		return fmt.Errorf("%w: invalid email address", ErrValidation)
+	}
 	return nil
 }

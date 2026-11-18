@@ -2,86 +2,120 @@ package auth
 
 import (
 	"errors"
+	"strings"
 	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
 var (
 	ErrInvalidToken = errors.New("invalid token")
 	ErrExpiredToken = errors.New("token expired")
+	ErrEmptySecret  = errors.New("jwt secret key cannot be empty")
 )
 
-// Claims представляет данные, хранимые в JWT токене
+// Claims представляет полезную нагрузку (payload), хранимую внутри JWT токена
 type Claims struct {
 	UserID   int    `json:"user_id"`
 	Email    string `json:"email"`
 	Username string `json:"username"`
-	// TODO: Добавить стандартные JWT claims
-	// Подсказка: используйте jwt.RegisteredClaims или jwt.StandardClaims
+	jwt.RegisteredClaims
 }
 
-// JWTManager управляет созданием и валидацией JWT токенов
+// JWTManager управляет генерацией и проверкой JWT токенов
 type JWTManager struct {
 	secretKey []byte
 	ttl       time.Duration
 }
 
-// NewJWTManager создает новый экземпляр JWT менеджера
+// NewJWTManager создает новый экземпляр JWT менеджера с заданным секретом и временем жизни
 func NewJWTManager(secretKey string, ttlHours int) *JWTManager {
-	// TODO: Инициализировать JWTManager
-	// - Преобразовать secretKey в []byte
-	// - Преобразовать ttlHours в time.Duration
-
-	return &JWTManager{}
+	if ttlHours <= 0 {
+		ttlHours = 24
+	}
+	return &JWTManager{
+		secretKey: []byte(secretKey),
+		ttl:       time.Duration(ttlHours) * time.Hour,
+	}
 }
 
-// GenerateToken создает новый JWT токен для пользователя
+// GenerateToken создает и подписывает новый JWT токен для пользователя
 func (m *JWTManager) GenerateToken(userID int, email, username string) (string, time.Time, error) {
-	// TODO: Реализовать генерацию JWT токена
-	// Шаги:
-	// 1. Создать Claims с данными пользователя
-	// 2. Установить время истечения токена (текущее время + ttl)
-	// 3. Создать токен используя алгоритм подписи (например, HS256)
-	// 4. Подписать токен секретным ключом
-	// 5. Вернуть подписанную строку токена и время истечения
-	//
-	// Подсказка: используйте библиотеку github.com/golang-jwt/jwt/v5
+	if len(m.secretKey) == 0 {
+		return "", time.Time{}, ErrEmptySecret
+	}
 
-	return "", time.Time{}, errors.New("not implemented")
+	now := time.Now()
+	expiresAt := now.Add(m.ttl)
+
+	claims := &Claims{
+		UserID:   userID,
+		Email:    email,
+		Username: username,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(expiresAt),
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signedToken, err := token.SignedString(m.secretKey)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+
+	return signedToken, expiresAt, nil
 }
 
-// ValidateToken проверяет и парсит JWT токен
+// ValidateToken проверяет подпись, допустимый алгоритм и срок действия JWT токена
 func (m *JWTManager) ValidateToken(tokenString string) (*Claims, error) {
-	// TODO: Реализовать валидацию и парсинг JWT токена
-	// Шаги:
-	// 1. Распарсить токен с проверкой подписи
-	// 2. Извлечь claims из токена
-	// 3. Проверить время истечения токена
-	// 4. Вернуть claims если токен валидный
-	//
-	// Обработать ошибки:
-	// - Невалидная подпись -> ErrInvalidToken
-	// - Истекший токен -> ErrExpiredToken
-	// - Другие ошибки -> ErrInvalidToken
+	if strings.TrimSpace(tokenString) == "" || len(m.secretKey) == 0 {
+		return nil, ErrInvalidToken
+	}
 
-	return nil, errors.New("not implemented")
+	token, err := jwt.ParseWithClaims(
+		tokenString,
+		&Claims{},
+		func(token *jwt.Token) (interface{}, error) {
+			// Явная проверка алгоритма подписи HMAC HS256
+			if token.Method.Alg() != jwt.SigningMethodHS256.Alg() {
+				return nil, ErrInvalidToken
+			}
+			return m.secretKey, nil
+		},
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+	)
+
+	if err != nil {
+		if errors.Is(err, jwt.ErrTokenExpired) {
+			return nil, ErrExpiredToken
+		}
+		return nil, ErrInvalidToken
+	}
+
+	claims, ok := token.Claims.(*Claims)
+	if !ok || !token.Valid {
+		return nil, ErrInvalidToken
+	}
+
+	return claims, nil
 }
 
-// RefreshToken обновляет существующий токен (опциональное задание)
+// RefreshToken перевыпускает новый JWT токен на основе действующего
 func (m *JWTManager) RefreshToken(tokenString string) (string, time.Time, error) {
-	// TODO: Реализовать обновление токена (продвинутое задание)
-	// Шаги:
-	// 1. Валидировать существующий токен
-	// 2. Извлечь данные пользователя из старого токена
-	// 3. Сгенерировать новый токен с теми же данными
-	// 4. Вернуть новый токен
-
-	return "", time.Time{}, errors.New("not implemented")
+	claims, err := m.ValidateToken(tokenString)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return m.GenerateToken(claims.UserID, claims.Email, claims.Username)
 }
 
-// GetUserIDFromToken быстро извлекает ID пользователя из токена без полной валидации
+// GetUserIDFromToken извлекает идентификатор пользователя из валидного токена
 func (m *JWTManager) GetUserIDFromToken(tokenString string) (int, error) {
-	// TODO: Извлечь UserID из токена (опциональное задание)
-	// Может быть полезно для быстрой проверки
-
-	return 0, errors.New("not implemented")
+	claims, err := m.ValidateToken(tokenString)
+	if err != nil {
+		return 0, err
+	}
+	return claims.UserID, nil
 }

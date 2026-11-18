@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 var (
@@ -14,11 +15,13 @@ var (
 	ErrForbidden    = errors.New("forbidden")
 )
 
+// PostService реализует бизнес-логику управления постами и проверку прав доступа
 type PostService struct {
 	postRepo repository.PostRepository
 	userRepo repository.UserRepository
 }
 
+// NewPostService создает новый экземпляр сервиса постов
 func NewPostService(postRepo repository.PostRepository, userRepo repository.UserRepository) *PostService {
 	return &PostService{
 		postRepo: postRepo,
@@ -26,85 +29,204 @@ func NewPostService(postRepo repository.PostRepository, userRepo repository.User
 	}
 }
 
+// Create валидирует данные и создает новый пост от имени текущего пользователя
 func (s *PostService) Create(ctx context.Context, userID int, req *model.PostCreateRequest) (*model.Post, error) {
-	// TODO: Создать новый пост
-	// Шаги:
-	// 1. Валидация данных (title не пустой и <= 200 символов, content не пустой)
-	// 2. Создать модель поста с данными из запроса и userID
-	// 3. Сохранить через репозиторий
-	// 4. Вернуть созданный пост
+	if userID <= 0 {
+		return nil, ErrUnauthorized
+	}
+	if err := validatePostCreateRequest(req); err != nil {
+		return nil, err
+	}
 
-	return nil, fmt.Errorf("not implemented")
+	post := &model.Post{
+		Title:    strings.TrimSpace(req.Title),
+		Content:  strings.TrimSpace(req.Content),
+		AuthorID: userID,
+	}
+
+	if err := s.postRepo.Create(ctx, post); err != nil {
+		return nil, fmt.Errorf("failed to create post: %w", err)
+	}
+
+	// Добавляем публичную информацию об авторе в ответ
+	if author, err := s.userRepo.GetByID(ctx, userID); err == nil {
+		resp := author.ToResponse()
+		post.Author = &resp
+	}
+
+	return post, nil
 }
 
+// GetByID возвращает пост по идентификатору и подгружает данные об авторе
 func (s *PostService) GetByID(ctx context.Context, id int) (*model.Post, error) {
-	// TODO: Получить пост по ID
-	// Шаги:
-	// 1. Получить пост через репозиторий
-	// 2. Опционально: загрузить информацию об авторе
-	// 3. Вернуть пост
+	post, err := s.postRepo.GetByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, repository.ErrPostNotFound) {
+			return nil, ErrPostNotFound
+		}
+		return nil, fmt.Errorf("failed to get post: %w", err)
+	}
 
-	return nil, fmt.Errorf("not implemented")
+	if author, err := s.userRepo.GetByID(ctx, post.AuthorID); err == nil {
+		resp := author.ToResponse()
+		post.Author = &resp
+	}
+
+	return post, nil
 }
 
+// GetAll возвращает список постов с нормализованной пагинацией и общим количеством записей
 func (s *PostService) GetAll(ctx context.Context, limit, offset int) ([]*model.Post, int, error) {
-	// TODO: Получить список постов с пагинацией
-	// Шаги:
-	// 1. Валидировать и нормализовать параметры пагинации (limit по умолчанию 10, максимум 100)
-	// 2. Получить посты через репозиторий
-	// 3. Получить общее количество для пагинации
-	// 4. Опционально: обогатить данные информацией об авторах
-	// 5. Вернуть посты и общее количество
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
 
-	return nil, 0, fmt.Errorf("not implemented")
+	posts, err := s.postRepo.GetAll(ctx, limit, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to get posts: %w", err)
+	}
+
+	total, err := s.postRepo.GetTotalCount(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to get total posts count: %w", err)
+	}
+
+	for _, p := range posts {
+		if author, err := s.userRepo.GetByID(ctx, p.AuthorID); err == nil {
+			resp := author.ToResponse()
+			p.Author = &resp
+		}
+	}
+
+	return posts, total, nil
 }
 
+// Update обновляет пост после проверки, что текущий пользователь является его автором
 func (s *PostService) Update(ctx context.Context, id int, userID int, req *model.PostUpdateRequest) (*model.Post, error) {
-	// TODO: Обновить пост
-	// Шаги:
-	// 1. Получить существующий пост
-	// 2. Проверить что userID является автором (иначе ErrForbidden)
-	// 3. Валидировать новые данные (если предоставлены)
-	// 4. Обновить только измененные поля
-	// 5. Сохранить через репозиторий
-	// 6. Вернуть обновленный пост
+	if err := validatePostUpdateRequest(req); err != nil {
+		return nil, err
+	}
 
-	return nil, fmt.Errorf("not implemented")
+	post, err := s.postRepo.GetByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, repository.ErrPostNotFound) {
+			return nil, ErrPostNotFound
+		}
+		return nil, fmt.Errorf("failed to get post: %w", err)
+	}
+
+	// Проверяем права доступа: редактировать может только автор
+	if !post.CanBeEditedBy(userID) {
+		return nil, ErrForbidden
+	}
+
+	post.Title = strings.TrimSpace(req.Title)
+	post.Content = strings.TrimSpace(req.Content)
+
+	if err := s.postRepo.Update(ctx, post); err != nil {
+		if errors.Is(err, repository.ErrPostNotFound) {
+			return nil, ErrPostNotFound
+		}
+		return nil, fmt.Errorf("failed to update post: %w", err)
+	}
+
+	if author, err := s.userRepo.GetByID(ctx, post.AuthorID); err == nil {
+		resp := author.ToResponse()
+		post.Author = &resp
+	}
+
+	return post, nil
 }
 
+// Delete удаляет пост после проверки, что текущий пользователь является его автором
 func (s *PostService) Delete(ctx context.Context, id int, userID int) error {
-	// TODO: Удалить пост
-	// Шаги:
-	// 1. Найти пост и проверить существование
-	// 2. Проверить что userID является автором
-	// 3. Удалить через репозиторий
-	// 4. Вернуть соответствующую ошибку при неудаче
+	post, err := s.postRepo.GetByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, repository.ErrPostNotFound) {
+			return ErrPostNotFound
+		}
+		return fmt.Errorf("failed to get post: %w", err)
+	}
 
-	return fmt.Errorf("not implemented")
-}
+	// Проверяем права доступа: удалять может только автор
+	if !post.CanBeDeletedBy(userID) {
+		return ErrForbidden
+	}
 
-func (s *PostService) GetByAuthor(ctx context.Context, authorID int, limit, offset int) ([]*model.Post, int, error) {
-	// TODO: Получить посты конкретного автора
-	// Шаги:
-	// 1. Валидировать параметры пагинации
-	// 2. Получить посты автора через репозиторий
-	// 3. Получить общее количество постов автора
-	// 4. Опционально: добавить информацию об авторе к постам
-	// 5. Вернуть результат с общим количеством
-
-	return nil, 0, fmt.Errorf("not implemented")
-}
-
-// validatePostCreateRequest проверяет корректность данных для создания поста
-func validatePostCreateRequest(req *model.PostCreateRequest) error {
-	// TODO: Реализовать валидацию title и content
+	if err := s.postRepo.Delete(ctx, id); err != nil {
+		if errors.Is(err, repository.ErrPostNotFound) {
+			return ErrPostNotFound
+		}
+		return fmt.Errorf("failed to delete post: %w", err)
+	}
 
 	return nil
 }
 
-// validatePostUpdateRequest проверяет корректность данных для обновления поста
-func validatePostUpdateRequest(req *model.PostUpdateRequest) error {
-	// TODO: Реализовать валидацию опциональных полей
+// GetByAuthor возвращает посты указанного автора с пагинацией
+func (s *PostService) GetByAuthor(ctx context.Context, authorID int, limit, offset int) ([]*model.Post, int, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
 
+	posts, err := s.postRepo.GetByAuthorID(ctx, authorID, limit, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to get posts by author: %w", err)
+	}
+
+	total, err := s.postRepo.GetCountByAuthorID(ctx, authorID)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to count posts by author: %w", err)
+	}
+
+	for _, p := range posts {
+		if author, err := s.userRepo.GetByID(ctx, p.AuthorID); err == nil {
+			resp := author.ToResponse()
+			p.Author = &resp
+		}
+	}
+
+	return posts, total, nil
+}
+
+// validatePostCreateRequest проверяет корректность полей при создании поста
+func validatePostCreateRequest(req *model.PostCreateRequest) error {
+	if req == nil {
+		return fmt.Errorf("%w: request body is empty", ErrValidation)
+	}
+	titleLen := len([]rune(strings.TrimSpace(req.Title)))
+	if titleLen == 0 || titleLen > 200 {
+		return fmt.Errorf("%w: title must be between 1 and 200 characters", ErrValidation)
+	}
+	if strings.TrimSpace(req.Content) == "" {
+		return fmt.Errorf("%w: content is required", ErrValidation)
+	}
+	return nil
+}
+
+// validatePostUpdateRequest проверяет корректность полей при обновлении поста
+func validatePostUpdateRequest(req *model.PostUpdateRequest) error {
+	if req == nil {
+		return fmt.Errorf("%w: request body is empty", ErrValidation)
+	}
+	titleLen := len([]rune(strings.TrimSpace(req.Title)))
+	if titleLen == 0 || titleLen > 200 {
+		return fmt.Errorf("%w: title must be between 1 and 200 characters", ErrValidation)
+	}
+	if strings.TrimSpace(req.Content) == "" {
+		return fmt.Errorf("%w: content is required", ErrValidation)
+	}
 	return nil
 }

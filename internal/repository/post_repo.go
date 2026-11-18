@@ -13,29 +13,18 @@ var (
 	ErrPostNotFound = errors.New("post not found")
 )
 
-// PostRepo представляет репозиторий для работы с постами
+// PostRepo реализует PostRepository для работы с PostgreSQL
 type PostRepo struct {
 	db *sql.DB
 }
 
-// NewPostRepo создает новый репозиторий постов
+// NewPostRepo создает новый экземпляр репозитория постов
 func NewPostRepo(db *sql.DB) *PostRepo {
 	return &PostRepo{db: db}
 }
 
-// Create создает новый пост
+// Create сохраняет новый пост в БД и присваивает ему сгенерированный ID
 func (r *PostRepo) Create(ctx context.Context, post *model.Post) error {
-	// TODO: Реализовать создание поста
-	// 1. Подготовить SQL запрос INSERT INTO posts...
-	// 2. Установить created_at и updated_at = time.Now()
-	// 3. Выполнить запрос и получить ID созданной записи
-	// 4. Установить ID в структуру post
-	//
-	// HINT: Используйте QueryRowContext с RETURNING id
-	// Пример запроса:
-	// INSERT INTO posts (title, content, author_id, created_at, updated_at)
-	// VALUES ($1, $2, $3, $4, $5) RETURNING id
-
 	query := `
 		INSERT INTO posts (title, content, author_id, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5)
@@ -46,21 +35,20 @@ func (r *PostRepo) Create(ctx context.Context, post *model.Post) error {
 	post.CreatedAt = now
 	post.UpdatedAt = now
 
-	// TODO: Выполнить запрос и обработать результат
-	// err := r.db.QueryRowContext(ctx, query, ...).Scan(&post.ID)
+	err := r.db.QueryRowContext(
+		ctx, query,
+		post.Title, post.Content, post.AuthorID, post.CreatedAt, post.UpdatedAt,
+	).Scan(&post.ID)
 
-	_ = query // Удалите эту строку после реализации
-	return fmt.Errorf("not implemented")
+	if err != nil {
+		return fmt.Errorf("failed to create post: %w", err)
+	}
+
+	return nil
 }
 
-// GetByID получает пост по ID
+// GetByID возвращает пост по его идентификатору
 func (r *PostRepo) GetByID(ctx context.Context, id int) (*model.Post, error) {
-	// TODO: Реализовать получение поста по ID
-	// 1. Подготовить SQL запрос SELECT ... FROM posts WHERE id = $1
-	// 2. Выполнить запрос
-	// 3. Просканировать результат в структуру Post
-	// 4. Обработать случай sql.ErrNoRows -> вернуть ErrPostNotFound
-
 	query := `
 		SELECT id, title, content, author_id, created_at, updated_at
 		FROM posts
@@ -68,128 +56,179 @@ func (r *PostRepo) GetByID(ctx context.Context, id int) (*model.Post, error) {
 	`
 
 	var post model.Post
-	// TODO: Выполнить запрос и просканировать результат
+	err := r.db.QueryRowContext(ctx, query, id).Scan(
+		&post.ID, &post.Title, &post.Content, &post.AuthorID, &post.CreatedAt, &post.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrPostNotFound
+		}
+		return nil, fmt.Errorf("failed to get post: %w", err)
+	}
 
-	_ = query // Удалите эту строку после реализации
-	return nil, fmt.Errorf("not implemented")
+	return &post, nil
 }
 
-// GetAll получает все посты с пагинацией
+// GetAll возвращает список постов, отсортированных по дате создания и ID (новые сверху), с пагинацией
 func (r *PostRepo) GetAll(ctx context.Context, limit, offset int) ([]*model.Post, error) {
-	// TODO: Реализовать получение всех постов с пагинацией
-	// 1. Подготовить SQL запрос с ORDER BY created_at DESC
-	// 2. Добавить LIMIT и OFFSET для пагинации
-	// 3. Выполнить запрос и получить rows
-	// 4. Итерировать по rows и собрать массив постов
-	// 5. Не забудьте закрыть rows (defer rows.Close())
-	//
-	// HINT: Используйте QueryContext для получения множества записей
-	// Пример запроса:
-	// SELECT id, title, content, author_id, created_at, updated_at
-	// FROM posts
-	// ORDER BY created_at DESC
-	// LIMIT $1 OFFSET $2
-
 	query := `
 		SELECT id, title, content, author_id, created_at, updated_at
 		FROM posts
-		ORDER BY created_at DESC
+		ORDER BY created_at DESC, id DESC
 		LIMIT $1 OFFSET $2
 	`
 
-	// TODO: Выполнить запрос
-	// rows, err := r.db.QueryContext(ctx, query, limit, offset)
-	// if err != nil { ... }
-	// defer rows.Close()
+	rows, err := r.db.QueryContext(ctx, query, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get posts: %w", err)
+	}
+	defer rows.Close()
 
-	// TODO: Итерировать по результатам
-	// var posts []*model.Post
-	// for rows.Next() {
-	//     var post model.Post
-	//     err := rows.Scan(&post.ID, &post.Title, ...)
-	//     posts = append(posts, &post)
-	// }
+	// Инициализируем пустой срез, чтобы в JSON возвращался [], а не null
+	posts := make([]*model.Post, 0)
+	for rows.Next() {
+		var post model.Post
+		if err := rows.Scan(
+			&post.ID, &post.Title, &post.Content, &post.AuthorID, &post.CreatedAt, &post.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan post: %w", err)
+		}
+		posts = append(posts, &post)
+	}
 
-	_ = query // Удалите эту строку после реализации
-	return nil, fmt.Errorf("not implemented")
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate posts: %w", err)
+	}
+
+	return posts, nil
 }
 
-// GetTotalCount получает общее количество постов
+// GetTotalCount возвращает общее количество постов в таблице
 func (r *PostRepo) GetTotalCount(ctx context.Context) (int, error) {
-	// TODO: Реализовать подсчет общего количества постов
-	// HINT: Используйте SELECT COUNT(*) FROM posts
-
 	query := `SELECT COUNT(*) FROM posts`
 
 	var count int
-	// TODO: Выполнить запрос и получить количество
+	if err := r.db.QueryRowContext(ctx, query).Scan(&count); err != nil {
+		return 0, fmt.Errorf("failed to count posts: %w", err)
+	}
 
-	_ = query // Удалите эту строку после реализации
-	return 0, fmt.Errorf("not implemented")
+	return count, nil
 }
 
-// Update обновляет пост
+// Update обновляет заголовок, текст и время изменения существующего поста с проверкой автора
 func (r *PostRepo) Update(ctx context.Context, post *model.Post) error {
-	// TODO: Реализовать обновление поста
-	// 1. Подготовить SQL запрос UPDATE posts SET ... WHERE id = $X
-	// 2. Обновить только title, content и updated_at
-	// 3. Выполнить запрос с помощью ExecContext
-	// 4. Проверить RowsAffected - если 0, вернуть ErrPostNotFound
-	//
-	// HINT:
-	// UPDATE posts
-	// SET title = $1, content = $2, updated_at = $3
-	// WHERE id = $4
-
-	query := `
-		UPDATE posts
-		SET title = $1, content = $2, updated_at = $3
-		WHERE id = $4
-	`
-
 	post.UpdatedAt = time.Now()
 
-	// TODO: Выполнить запрос
-	// result, err := r.db.ExecContext(ctx, query, ...)
-	// Проверить RowsAffected
+	var (
+		res sql.Result
+		err error
+	)
 
-	_ = query // Удалите эту строку после реализации
-	return fmt.Errorf("not implemented")
+	if post.AuthorID > 0 {
+		query := `
+			UPDATE posts
+			SET title = $1, content = $2, updated_at = $3
+			WHERE id = $4 AND author_id = $5
+		`
+		res, err = r.db.ExecContext(ctx, query, post.Title, post.Content, post.UpdatedAt, post.ID, post.AuthorID)
+	} else {
+		query := `
+			UPDATE posts
+			SET title = $1, content = $2, updated_at = $3
+			WHERE id = $4
+		`
+		res, err = r.db.ExecContext(ctx, query, post.Title, post.Content, post.UpdatedAt, post.ID)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to update post: %w", err)
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+	if rowsAffected == 0 {
+		return ErrPostNotFound
+	}
+
+	return nil
 }
 
-// Delete удаляет пост
+// Delete удаляет пост по ID
 func (r *PostRepo) Delete(ctx context.Context, id int) error {
-	// TODO: Реализовать удаление поста
-	// 1. Подготовить SQL запрос DELETE FROM posts WHERE id = $1
-	// 2. Выполнить запрос с помощью ExecContext
-	// 3. Проверить RowsAffected - если 0, вернуть ErrPostNotFound
-
 	query := `DELETE FROM posts WHERE id = $1`
 
-	// TODO: Выполнить запрос и проверить результат
+	res, err := r.db.ExecContext(ctx, query, id)
+	if err != nil {
+		return fmt.Errorf("failed to delete post: %w", err)
+	}
 
-	_ = query // Удалите эту строку после реализации
-	return fmt.Errorf("not implemented")
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+	if rowsAffected == 0 {
+		return ErrPostNotFound
+	}
+
+	return nil
 }
 
-// Exists проверяет существование поста
+// Exists проверяет, существует ли пост с заданным ID
 func (r *PostRepo) Exists(ctx context.Context, id int) (bool, error) {
-	// TODO: Реализовать проверку существования поста
-	// HINT: SELECT EXISTS(SELECT 1 FROM posts WHERE id = $1)
-
 	query := `SELECT EXISTS(SELECT 1 FROM posts WHERE id = $1)`
 
 	var exists bool
-	// TODO: Выполнить запрос и получить результат
+	if err := r.db.QueryRowContext(ctx, query, id).Scan(&exists); err != nil {
+		return false, fmt.Errorf("failed to check post existence: %w", err)
+	}
 
-	_ = query // Удалите эту строку после реализации
-	return false, fmt.Errorf("not implemented")
+	return exists, nil
 }
 
-// GetByAuthorID получает посты определенного автора
+// GetByAuthorID возвращает посты конкретного автора с поддержкой пагинации и стабильной сортировкой
 func (r *PostRepo) GetByAuthorID(ctx context.Context, authorID int, limit, offset int) ([]*model.Post, error) {
-	// TODO: (Опционально) Реализовать получение постов автора
-	// Аналогично GetAll, но с дополнительным условием WHERE author_id = $X
+	query := `
+		SELECT id, title, content, author_id, created_at, updated_at
+		FROM posts
+		WHERE author_id = $1
+		ORDER BY created_at DESC, id DESC
+		LIMIT $2 OFFSET $3
+	`
 
-	return nil, fmt.Errorf("not implemented")
+	rows, err := r.db.QueryContext(ctx, query, authorID, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get posts by author: %w", err)
+	}
+	defer rows.Close()
+
+	posts := make([]*model.Post, 0)
+	for rows.Next() {
+		var post model.Post
+		if err := rows.Scan(
+			&post.ID, &post.Title, &post.Content, &post.AuthorID, &post.CreatedAt, &post.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan post: %w", err)
+		}
+		posts = append(posts, &post)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate posts: %w", err)
+	}
+
+	return posts, nil
+}
+
+// GetCountByAuthorID возвращает общее количество постов конкретного автора
+func (r *PostRepo) GetCountByAuthorID(ctx context.Context, authorID int) (int, error) {
+	query := `SELECT COUNT(*) FROM posts WHERE author_id = $1`
+
+	var count int
+	if err := r.db.QueryRowContext(ctx, query, authorID).Scan(&count); err != nil {
+		return 0, fmt.Errorf("failed to count posts by author: %w", err)
+	}
+
+	return count, nil
 }
